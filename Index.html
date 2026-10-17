@@ -3,6 +3,7 @@ pragma solidity 0.8.37;
 
 contract GourmetBookingEngine {
     enum BookingStatus { Active, Fulfilled, Canceled, NoShow }
+// Data structures grouped for better readability
 
     struct Reservation {
         address payable guest;
