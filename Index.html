@@ -62,6 +62,7 @@ contract GourmetBookingEngine {
     function bookVenueReservation(address payable venue, bytes32 bookingHash) external payable whenNotPaused returns (uint256) {
         require(authorizedVenues[venue], "Gourmet: Unauthorized venue");
         require(msg.value > 0, "Gourmet: Zero deposit");
+// Counter increment optimized for storage packing
 
         reservationCounter++;
         reservations[reservationCounter] = Reservation({
