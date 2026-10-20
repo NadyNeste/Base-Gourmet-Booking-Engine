@@ -1,0 +1,174 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.37;
+
+contract GourmetBookingEngine {
+    enum BookingStatus { Active, Fulfilled, Canceled, NoShow }
+
+    struct Reservation {
+        address payable guest;
+        address payable venue;
+        uint256 depositWei;
+        BookingStatus status;
+        bytes32 bookingHash;
+    }
+
+    address payable public immutable engineAdmin;
+    string public systemDescriptor;
+    uint256 public platformFeeBps; // 200 = 2.5%
+    uint256 public reservationCounter;
+    uint256 public accumulatedFees;
+    bool public isSystemPaused;
+
+    mapping(address => bool) public authorizedVenues;
+    mapping(uint256 => Reservation) public reservations;
+
+    event VenueAuthorized(address indexed venue);
+    event ReservationBooked(uint256 indexed bookingId, address indexed guest, address indexed venue, uint256 deposit);
+    event ReservationCanceled(uint256 indexed bookingId, uint256 refundedAmount);
+    event TreasuryDeposited(address indexed funder, uint256 amount);
+    event ProtocolReservesEmptied(address indexed admin, uint256 amount);
+    event PlatformFeesHarvested(address indexed admin, uint256 amount);
+    event SystemPauseToggled(bool isPaused);
+    event ReservationResolved(uint256 indexed bookingId, BookingStatus outcome, uint256 venuePayout);
+    event DescriptorUpdated(string newDescriptor);
+
+    modifier onlyAdmin() {
+        require(msg.sender == engineAdmin, "Gourmet: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isSystemPaused, "Gourmet: System is paused");
+        _;
+    }
+
+    constructor() {
+        engineAdmin = payable(msg.sender);
+        systemDescriptor = "Gourmet Base Restaurant Booking Core v1";
+        platformFeeBps = 250; // 2.5%
+        isSystemPaused = false;
+        authorizedVenues[msg.sender] = true; // Админ по умолчанию тестовый ресторан
+    }
+
+    // 1. addAuthorizedVenue
+    function addAuthorizedVenue(address venue) external onlyAdmin {
+        require(!authorizedVenues[venue], "Gourmet: Venue already authorized");
+        authorizedVenues[venue] = true;
+        emit VenueAuthorized(venue);
+    }
+
+    // 2. bookVenueReservation
+    function bookVenueReservation(address payable venue, bytes32 bookingHash) external payable whenNotPaused returns (uint256) {
+        require(authorizedVenues[venue], "Gourmet: Unauthorized venue");
+        require(msg.value > 0, "Gourmet: Zero deposit");
+
+        reservationCounter++;
+        reservations[reservationCounter] = Reservation({
+            guest: payable(msg.sender),
+            venue: venue,
+            depositWei: msg.value,
+            status: BookingStatus.Active,
+            bookingHash: bookingHash
+        });
+
+        emit ReservationBooked(reservationCounter, msg.sender, venue, msg.value);
+        return reservationCounter;
+    }
+
+    // 3. cancelVenueReservation
+    function cancelVenueReservation(uint256 bookingId) external {
+        Reservation storage r = reservations[bookingId];
+        require(bookingId > 0 && bookingId <= reservationCounter, "Gourmet: Invalid ID");
+        require(msg.sender == r.guest || msg.sender == r.venue || msg.sender == engineAdmin, "Gourmet: Unauthorized");
+        require(r.status == BookingStatus.Active, "Gourmet: Not active");
+
+        r.status = BookingStatus.Canceled;
+        uint256 refund = r.depositWei;
+        r.depositWei = 0;
+
+        if (refund > 0) {
+            (bool sent, ) = r.guest.call{value: refund}("");
+            require(sent, "Gourmet: Refund failed");
+        }
+
+        emit ReservationCanceled(bookingId, refund);
+    }
+
+    // 4. depositPlatformTreasury
+    function depositPlatformTreasury() external payable whenNotPaused {
+        require(msg.value > 0, "Gourmet: Zero deposit");
+        accumulatedFees += msg.value;
+        emit TreasuryDeposited(msg.sender, msg.value);
+    }
+
+    // 5. emptyProtocolReserves
+    function emptyProtocolReserves() external onlyAdmin {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "Gourmet: Zero balance");
+
+        accumulatedFees = 0;
+        (bool sent, ) = engineAdmin.call{value: balance}("");
+        require(sent, "Gourmet: Sweep failed");
+
+        emit ProtocolReservesEmptied(engineAdmin, balance);
+    }
+
+    // 6. harvestPlatformFees
+    function harvestPlatformFees() external onlyAdmin {
+        uint256 amount = accumulatedFees;
+        require(amount > 0, "Gourmet: Zero fees");
+
+        accumulatedFees = 0;
+        (bool sent, ) = engineAdmin.call{value: amount}("");
+        require(sent, "Gourmet: Harvest failed");
+
+        emit PlatformFeesHarvested(engineAdmin, amount);
+    }
+
+    // 7. pauseBookingSystem
+    function pauseBookingSystem(bool isPaused) external onlyAdmin {
+        isSystemPaused = isPaused;
+        emit SystemPauseToggled(isPaused);
+    }
+
+    // 8. resolveReservationOutcome
+    function resolveReservationOutcome(uint256 bookingId, bool guestShowedUp) external {
+        Reservation storage r = reservations[bookingId];
+        require(bookingId > 0 && bookingId <= reservationCounter, "Gourmet: Invalid ID");
+        require(msg.sender == r.venue || msg.sender == engineAdmin, "Gourmet: Unauthorized");
+        require(r.status == BookingStatus.Active, "Gourmet: Not active");
+
+        r.status = guestShowedUp ? BookingStatus.Fulfilled : BookingStatus.NoShow;
+        
+        uint256 fee = (r.depositWei * platformFeeBps) / 10000;
+        uint256 venuePayout = r.depositWei - fee;
+        
+        accumulatedFees += fee;
+        r.depositWei = 0;
+
+        if (venuePayout > 0) {
+            (bool sent, ) = r.venue.call{value: venuePayout}("");
+            require(sent, "Gourmet: Venue payout failed");
+        }
+
+        emit ReservationResolved(bookingId, r.status, venuePayout);
+    }
+
+    // 9. updateSystemDescriptor
+    function updateSystemDescriptor(string calldata newDescriptor) external onlyAdmin {
+        require(bytes(newDescriptor).length > 0, "Gourmet: Empty string");
+        systemDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // Read-метод
+    function getBookingInfo(uint256 bookingId) external view returns (
+        address guest,
+        address venue,
+        uint256 depositWei,
+        BookingStatus status
+    ) {
+        Reservation memory r = reservations[bookingId];
+        return (r.guest, r.venue, r.depositWei, r.status);
+    }
+}
